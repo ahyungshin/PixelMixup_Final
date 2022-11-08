@@ -17,7 +17,7 @@ from data.randaugment import affine_sample
 from torch.autograd import Variable
 
 from scipy.stats import entropy
-
+from models.dacs import *
 
 class feat_prototype_distance_module(nn.Module):
     def __init__(self):
@@ -303,16 +303,90 @@ class CustomModel():
         loss_CTS = cross_entropy2d(input=target_out['out'], target=threshold_arg.reshape([batch, w, h])) 
     
         
-        pixelmix=True
-        if pixelmix:
-            # scheduled pixelmix
-            with torch.no_grad():
-                # rate = 0.5 - (0.5/60000)*iter
+        pixelmix=False
+        pixelmixup=True
 
+        with torch.no_grad():
+            means = torch.Tensor([[[[123.6750]],[[116.2800]],[[103.5300]]],
+                            [[[123.6750]],[[116.2800]],[[103.5300]]]]).cuda()
+            stds = torch.Tensor([[[[58.3950]],[[57.1200]],[[57.3750]]],
+                            [[[58.3950]],[[57.1200]],[[57.3750]]]]).cuda()
+            param = {
+                'color_jitter': random.uniform(0, 1),
+                'color_jitter_s': 0.2,
+                'color_jitter_p': 0.2,
+                'blur': random.uniform(0, 1),
+                'mean': means[0].unsqueeze(0),  # assume same normalization
+                'std': stds[0].unsqueeze(0)}
+
+
+            if pixelmix is True:
                 # rectified_ = F.interpolate(rectified, scale_factor=4) #, mode='bilinear', align_corners=True)
-                # pred_logits, pred_idx = rectified_.max(1, keepdim=True)
-                threshold_arg_ = F.interpolate(threshold_arg.to(dtype=torch.float32), scale_factor=4)
-                argmax = F.interpolate(argmax.to(dtype=torch.float32), scale_factor=4)
+                # pred_logits, pred_idx = rectified_.max(1)
+                pred_idx = F.interpolate(threshold_arg.to(dtype=torch.float32), scale_factor=4).to(dtype=torch.float32) #index
+                pred_logits = F.interpolate(argmax.to(dtype=torch.float32), scale_factor=4) #value
+
+                mixed_img, mixed_lbl = [None] * self.opt.bs, [None] * self.opt.bs
+                for i in range(self.opt.bs):
+                    T = torch.topk(torch.flatten(pred_logits[i]), k=int(512*896*0.5))[0][-1]
+                    mask_1 = (pred_logits[i].unsqueeze(0) > T) # [1,19,w,h]
+                    mask_2 = mask_1.repeat(1,3,1,1) # [1,3,w,h] for img
+                    mixed_lbl[i] = torch.where(mask_1, pred_idx[i].squeeze(0), source_label[i].squeeze(0).to(dtype=torch.float32))
+                    mixed_img[i] = torch.where(mask_2, target_ori[i].squeeze(0), source_x[i].squeeze(0))
+
+                    mixed_img[i], mixed_lbl[i] = color_jitter(
+                        color_jitter=param['color_jitter'],
+                        s=param['color_jitter_s'],
+                        p=param['color_jitter_p'],
+                        mean=param['mean'],
+                        std=param['std'],
+                        data=mixed_img[i],
+                        target=mixed_lbl[i])
+                    mixed_img[i], mixed_lbl[i] = gaussian_blur(blur=param['blur'], data=mixed_img[i], target=mixed_lbl[i])
+
+
+                mixed_img = torch.cat(mixed_img)
+                mixed_label = torch.cat(mixed_lbl).squeeze(1).to(dtype=torch.long)
+
+
+            
+                # from PIL import Image
+                # import cv2
+                # tt = source_x[0].permute(1,2,0).detach().cpu().numpy()
+                # tt=np.asarray(tt)
+                # tt=tt*255
+                # tt=tt[:,:,::-1]
+                # #RGB BGR
+                # pil_image=Image.fromarray((tt).astype(np.uint8))
+                # pil_image.save('/data/shinahyung/code/3CUDA/CPSL_stage1_ours/source_{}.jpg'.format(iter_i))
+                # #-------------------------------------
+                # tt = target_ori[0].permute(1,2,0).detach().cpu().numpy()
+                # tt=np.asarray(tt)
+                # tt=tt*255
+                # tt=tt[:,:,::-1]
+                # #RGB BGR
+                # pil_image=Image.fromarray((tt).astype(np.uint8))
+                # pil_image.save('/data/shinahyung/code/3CUDA/CPSL_stage1_ours/target_{}.jpg'.format(iter_i))
+                # #-------------------------------------
+                # #RGB BGR
+                # tt = mixed_img[0].permute(1,2,0).detach().cpu().numpy()
+                # tt=np.asarray(tt)
+                # tt=tt*255
+                # tt=tt[:,:,::-1]
+                # pil_image=Image.fromarray((tt).astype(np.uint8))
+                # pil_image.save('/data/shinahyung/code/3CUDA/CPSL_stage1_ours/mix_{}.jpg'.format(iter_i))
+                # print("plot@@")
+
+                mixed_out = self.BaseNet_DP(mixed_img)
+                mixed_out = mixed_out['out']
+                mixed_out = F.interpolate(mixed_out, size=target_ori.shape[2:], mode='bilinear', align_corners=True)
+
+                loss_pixelmix = cross_entropy2d(input=mixed_out, target=mixed_label)
+
+
+            if pixelmixup is True:
+                threshold_arg_ = F.interpolate(threshold_arg.to(dtype=torch.float32), scale_factor=4) #index
+                argmax = F.interpolate(argmax.to(dtype=torch.float32), scale_factor=4) #value
 
                 ent = entropy(rectified.detach().cpu().numpy(), axis=1) # [4,128,224]
                 ent = torch.Tensor(ent).unsqueeze(1)
@@ -320,36 +394,69 @@ class CustomModel():
 
                 mask_1, mixed_img, mixed_lbl_s, mixed_lbl_t = [None] * self.opt.bs, [None] * self.opt.bs, [None] * self.opt.bs, [None] * self.opt.bs
                 for i in range(self.opt.bs):
-                    T = torch.topk(torch.flatten(argmax[i]), k=int(512*896*0.5))[0][-1]
-                    # 1:0
-                    # mask_1 = (pred_logits[i].unsqueeze(0) > T) # [1,19,w,h]
-                    # mask_2 = mask_1.repeat(1,3,1,1) # [1,3,w,h] for img
-                    # mixed_lbl[i] = torch.where(mask_1, pred_idx[i].squeeze(0), source_label[i].squeeze(0)) 
-                    # mixed_img[i] = torch.where(mask_2, target_x[i].squeeze(0), source_x[i].squeeze(0))
-
                     # dynamic mixup
+                    T = torch.topk(torch.flatten(argmax[i]), k=int(512*896*0.5))[0][-1]
                     rate_t = (1 / (1+ent[i].unsqueeze(0))).cuda()
                     mask_1[i] = (argmax[i] > T).to(dtype=torch.float32).unsqueeze(0) # [1,1,512,896]
                     mask_1[i] *= rate_t
                     mask_2 = mask_1[i].repeat(1,3,1,1) # [1,3,512,896]
                     
-                    
                     mixed_lbl_s[i] = source_label[i].unsqueeze(0) # [1,512,896]
                     mixed_lbl_t[i] = threshold_arg_[i].unsqueeze(0) # [1,512,896]
-                    mixed_img[i] = (mask_2 * target_x[i].squeeze(0)) + ((1-mask_2)*source_x[i].squeeze(0))
+                    mixed_img[i] = (mask_2 * target_ori[i].squeeze(0)) + ((1-mask_2)*source_x[i].squeeze(0))
+
+                    mixed_img[i], mixed_lbl_t[i] = color_jitter(
+                        color_jitter=param['color_jitter'],
+                        s=param['color_jitter_s'],
+                        p=param['color_jitter_p'],
+                        mean=param['mean'],
+                        std=param['std'],
+                        data=mixed_img[i],
+                        target=mixed_lbl_t[i])
+                    mixed_img[i], mixed_lbl_t[i] = gaussian_blur(blur=param['blur'], data=mixed_img[i], target=mixed_lbl_t[i])
 
                 mask_1 = torch.cat(mask_1)
                 mixed_img = torch.cat(mixed_img)
-                mixed_label_s = torch.cat(mixed_lbl_s)#.unsqueeze(1)
+                mixed_label_s = torch.cat(mixed_lbl_s)
                 mixed_label_t = torch.cat(mixed_lbl_t).squeeze(1).to(dtype=torch.long)
 
-            mixed_out = self.BaseNet_DP(mixed_img)
-            mixed_out = mixed_out['out']
-            mixed_out = F.interpolate(mixed_out, size=target_x.shape[2:], mode='bilinear', align_corners=True)
+            
+                # from PIL import Image
+                # import cv2
+                # tt = source_x[0].permute(1,2,0).detach().cpu().numpy()
+                # tt=np.asarray(tt)
+                # tt=tt*255
+                # tt=tt[:,:,::-1]
+                # #RGB BGR
+                # pil_image=Image.fromarray((tt).astype(np.uint8))
+                # pil_image.save('/data/shinahyung/code/3CUDA/ours_pixelmix/source_{}.jpg'.format(iter_i))
+                # #-------------------------------------
+                # tt = target_ori[0].permute(1,2,0).detach().cpu().numpy()
+                # tt=np.asarray(tt)
+                # tt=tt*255
+                # tt=tt[:,:,::-1]
+                # #RGB BGR
+                # pil_image=Image.fromarray((tt).astype(np.uint8))
+                # pil_image.save('/data/shinahyung/code/3CUDA/ours_pixelmix/target_{}.jpg'.format(iter_i))
+                # #-------------------------------------
+                # #RGB BGR
+                # tt = mixed_img[0].permute(1,2,0).detach().cpu().numpy()
+                # tt=np.asarray(tt)
+                # tt=tt*255
+                # tt=tt[:,:,::-1]
+                # pil_image=Image.fromarray((tt).astype(np.uint8))
+                # pil_image.save('/data/shinahyung/code/3CUDA/ours_pixelmix/mix_{}.jpg'.format(iter_i))
+                # print("plot!!")                
 
-            # loss_pixelmix = cross_entropy2d(input=mixed_out, target=mixed_label)
-            loss_pixelmix = (mask_1 * self.cross_entropy_criterion(mixed_out, mixed_label_t)) + ((1-mask_1)*self.cross_entropy_criterion(mixed_out, mixed_label_s))
-            loss_pixelmix = torch.mean(loss_pixelmix)    
+
+                mixed_out = self.BaseNet_DP(mixed_img)
+                mixed_out = mixed_out['out']
+                mixed_out = F.interpolate(mixed_out, size=target_ori.shape[2:], mode='bilinear', align_corners=True)
+
+                # loss_pixelmix = cross_entropy2d(input=mixed_out, target=mixed_label)
+                loss_pixelmix = (mask_1 * self.cross_entropy_criterion(mixed_out, mixed_label_t)) + ((1-mask_1)*self.cross_entropy_criterion(mixed_out, mixed_label_s))
+                loss_pixelmix = torch.mean(loss_pixelmix)    
+
 
 
         #  ============ self-labeling loss ... ============  
